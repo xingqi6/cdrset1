@@ -8,76 +8,76 @@ import json
 import urllib.request
 from datetime import datetime
 
-# ================= 配置区域 =================
-# 外部 WebDAV 备份 (用于存数据库，重启不丢数据的关键)
+# === 环境变量 ===
 WEBDAV_URL = os.environ.get("WEBDAV_URL", "").rstrip('/')
 WEBDAV_USER = os.environ.get("WEBDAV_USERNAME")
 WEBDAV_PASS = os.environ.get("WEBDAV_PASSWORD")
 BACKUP_PATH = os.environ.get("WEBDAV_BACKUP_PATH", "cloud_kernel_backup").strip('/')
-SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", 1800)) # 默认30分钟备份一次
-SYS_TOKEN = os.environ.get("SYS_TOKEN", "Admin123456")    # Alist 管理密码
+SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", 1800)) 
+SYS_TOKEN = os.environ.get("SYS_TOKEN", "123456") 
 
-# ================= 路径定义 =================
+# === 路径定义 ===
 CORE_DIR = "/usr/local/sys_kernel"
 ALIST_BIN = f"{CORE_DIR}/io_driver"
 CLOUD_BIN = f"{CORE_DIR}/net_service"
-
-# 数据库文件 (这两个文件是“灵魂”，必须备份)
-ALIST_DB = f"{CORE_DIR}/data/data.db"
-CLOUD_DB = f"{CORE_DIR}/sys.db"
-
-# 备份文件前缀
+ALIST_DB_LOCAL = f"{CORE_DIR}/data/data.db"
+CLOUD_DB_LOCAL = f"{CORE_DIR}/sys.db"
 PREFIX_ALIST = "bk_io_"
 PREFIX_CLOUD = "bk_net_"
 
-# 进程句柄
 p_nginx = None
 p_alist = None
 p_cloud = None
 
-# ================= 网络修复 (解决 TLS Handshake) =================
-def resolve_ip_doh(domain):
-    """通过 Google DoH 获取真实 IP，绕过容器 DNS"""
-    try:
-        url = f"https://dns.google/resolve?name={domain}&type=A"
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=5) as response:
-            data = json.loads(response.read().decode())
-            if "Answer" in data:
-                for ans in data["Answer"]:
-                    if ans["type"] == 1: return ans["data"]
-    except: pass
-    return None
-
-def patch_network():
-    print(">>> [Kernel] Optimizing network routing...")
-    targets = ["huggingface.co", "cdn-lfs.huggingface.co"]
-    # 保底 IP (AWS US-East-1)
-    fallback_map = {"huggingface.co": "18.172.170.60"}
+# === 网络修复核心 (添加了 s3 域名) ===
+def patch_network_final():
+    print(">>> [Kernel] Applying stable network patch...")
+    
+    # 关键修改：同时修复 主域名 和 S3域名
+    targets = [
+        "huggingface.co", 
+        "s3.huggingface.co", 
+        "cdn-lfs.huggingface.co"
+    ]
+    
+    # 使用 CloudFront 的稳定 IP (AWS US-East-1)
+    stable_ips = [
+        "18.172.170.60",
+        "18.172.170.92",
+        "18.172.170.36",
+        "18.172.170.52"
+    ]
     
     try:
-        # 优先读 hosts
+        # 1. 优先读 hosts
         with open("/etc/nsswitch.conf", "w") as f:
             f.write("hosts: files dns\nnetworks: files\n")
-            
-        with open("/etc/hosts", "a") as f:
-            f.write("\n# Network Optimization\n")
-            for domain in targets:
-                ip = resolve_ip_doh(domain)
-                if not ip and domain in fallback_map: ip = fallback_map[domain]
-                if ip:
-                    f.write(f"{ip} {domain}\n")
-                    print(f">>> [Kernel] Route added: {domain} -> {ip}")
-    except Exception as e:
-        print(f">>> [Kernel] Network patch warning: {e}")
 
-# ================= 备份与恢复 (核心逻辑) =================
+        # 2. 写入 hosts
+        with open("/etc/hosts", "a") as f:
+            f.write(f"\n# Stable Patch\n")
+            for domain in targets:
+                # 为每个域名写入所有 IP，实现简单的负载均衡
+                for ip in stable_ips:
+                    f.write(f"{ip} {domain}\n")
+        
+        print(">>> [Kernel] Network patched: S3 & Main domains fixed.")
+    except Exception as e:
+        print(f">>> [Kernel] Patch failed: {e}")
+
+# === 工具函数 ===
 def run_cmd(cmd):
     try:
         subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except: return False
 
+def set_secret():
+    try:
+        subprocess.run([ALIST_BIN, "admin", "set", SYS_TOKEN], cwd=CORE_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except: pass
+
+# === 备份逻辑 (WebDAV) ===
 def get_remote_url(filename):
     return f"{WEBDAV_URL}/{BACKUP_PATH}/{filename}"
 
@@ -96,7 +96,6 @@ def list_remote_files():
     except: return []
 
 def cleanup_old_backups(prefix):
-    """只保留最新的 5 份备份"""
     all_files = list_remote_files()
     target_files = sorted([f for f in all_files if f.startswith(prefix)])
     while len(target_files) > 5:
@@ -104,90 +103,52 @@ def cleanup_old_backups(prefix):
         run_cmd(f"curl -X DELETE -u '{WEBDAV_USER}:{WEBDAV_PASS}' '{get_remote_url(oldest)}' --silent --insecure")
 
 def backup_data():
-    """上传数据库到 WebDAV"""
     if not WEBDAV_URL: return
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # 备份 Alist 数据
-    if os.path.exists(ALIST_DB):
+    if os.path.exists(ALIST_DB_LOCAL):
         name = f"{PREFIX_ALIST}{timestamp}.db"
-        run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' -T '{ALIST_DB}' '{get_remote_url(name)}' --silent --insecure")
+        run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' -T '{ALIST_DB_LOCAL}' '{get_remote_url(name)}' --silent --insecure")
         cleanup_old_backups(PREFIX_ALIST)
-        
-    # 备份 Cloudreve 数据
-    if os.path.exists(CLOUD_DB):
+    if os.path.exists(CLOUD_DB_LOCAL):
         name = f"{PREFIX_CLOUD}{timestamp}.db"
-        run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' -T '{CLOUD_DB}' '{get_remote_url(name)}' --silent --insecure")
+        run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' -T '{CLOUD_DB_LOCAL}' '{get_remote_url(name)}' --silent --insecure")
         cleanup_old_backups(PREFIX_CLOUD)
-    
-    print(f">>> [Kernel] State synced at {timestamp}")
 
 def restore_data():
-    """从 WebDAV 拉取最新数据库"""
     if not WEBDAV_URL: return
-    print(">>> [Kernel] Restoring system state...")
     ensure_remote_dir()
     all_files = list_remote_files()
-    
-    # 恢复 Alist
     alist_bks = sorted([f for f in all_files if f.startswith(PREFIX_ALIST)])
     if alist_bks:
-        latest = alist_bks[-1]
-        print(f">>> [Kernel] Loading IO state: {latest}")
-        run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' '{get_remote_url(latest)}' -o '{ALIST_DB}' --silent --insecure")
-    
-    # 恢复 Cloudreve
+        run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' '{get_remote_url(alist_bks[-1])}' -o '{ALIST_DB_LOCAL}' --silent --insecure")
     cloud_bks = sorted([f for f in all_files if f.startswith(PREFIX_CLOUD)])
     if cloud_bks:
-        latest = cloud_bks[-1]
-        print(f">>> [Kernel] Loading Net state: {latest}")
-        run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' '{get_remote_url(latest)}' -o '{CLOUD_DB}' --silent --insecure")
+        run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' '{get_remote_url(cloud_bks[-1])}' -o '{CLOUD_DB_LOCAL}' --silent --insecure")
 
-def set_password():
-    """强制设置 Alist 密码"""
-    try:
-        subprocess.run([ALIST_BIN, "admin", "set", SYS_TOKEN], cwd=CORE_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except: pass
-
-# ================= 服务管理 =================
-def start_system():
+# === 启动流程 ===
+def start_services():
     global p_nginx, p_alist, p_cloud
-    
-    # 1. 修复网络
-    patch_network()
-    
-    # 2. 准备目录
+    patch_network_final() # 执行网络修复
     os.makedirs(f"{CORE_DIR}/data", exist_ok=True)
-    
-    # 3. 启动 IO 驱动 (Alist)
     p_alist = subprocess.Popen([ALIST_BIN, "server", "--no-prefix"], cwd=CORE_DIR)
-    
-    # 4. 设置密码 (等待启动后)
     time.sleep(5)
-    set_password()
-    
-    # 5. 启动网络服务 (Cloudreve)
+    set_secret() 
     p_cloud = subprocess.Popen([CLOUD_BIN, "-c", "conf.ini"], cwd=CORE_DIR)
-    
-    # 6. 启动伪装网关 (Nginx)
     print(">>> [Kernel] System Online.")
     p_nginx = subprocess.Popen(["nginx", "-g", "daemon off;"])
 
 def stop_handler(signum, frame):
-    print(">>> [Kernel] Stopping...")
     if p_nginx: p_nginx.terminate()
     if p_cloud: p_cloud.terminate()
     if p_alist: p_alist.terminate()
-    backup_data() # 退出前强制备份
+    backup_data()
     sys.exit(0)
 
 if __name__ == "__main__":
-    restore_data() # 启动前先恢复
-    start_system()
-    
+    restore_data()
+    start_services()
     signal.signal(signal.SIGTERM, stop_handler)
     signal.signal(signal.SIGINT, stop_handler)
-    
     step = 0
     while True:
         time.sleep(1)
