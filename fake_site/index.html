@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Global Eco-Data Monitoring Archive | GEDMA</title>
+    <style>
+        :root {
+            --primary-color: #2c5e2e;
+            --bg-color: #f4f9f4;
+            --text-color: #333;
+            --card-bg: #ffffff;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+
+        .container {
+            background-color: var(--card-bg);
+            padding: 40px;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+            max-width: 600px;
+            width: 90%;
+            text-align: center;
+            border-top: 5px solid var(--primary-color);
+        }
+
+        h1 {
+            color: var(--primary-color);
+            font-size: 24px;
+            margin-bottom: 10px;
+            font-weight: 600;
+        }
+
+        .subtitle {
+            font-size: 14px;
+            color: #666;
+            margin-bottom: 30px;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+        }
+
+        .status-box {
+            background-color: #e8f5e9;
+            border: 1px solid #c8e6c9;
+            color: #2e7d32;
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 25px;
+            font-size: 14px;
+            display: inline-block;
+            width: 100%;
+            box-sizing: border-box;
+        }
+
+        .status-icon {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            background-color: #4caf50;
+            border-radius: 50%;
+            margin-right: 8px;
+            animation: pulse 2s infinite;
+        }
+
+        p {
+            line-height: 1.6;
+            margin-bottom: 20px;
+            font-size: 15px;
+            color: #444;
+            text-align: left;
+        }
+
+        .footer {
+            margin-top: 40px;
+            font-size: 12px;
+            color: #999;
+            border-top: 1px solid #eee;
+            padding-top: 20px;
+        }
+
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(76, 175, 80, 0.4); }
+            70% { box-shadow: 0 0 0 10px rgba(76, 175, 80, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(76, 175, 80, 0); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Global Eco-Data Archive</h1>
+        <div class="subtitle">Environmental Monitoring Node: AP-CN-04</div>
+
+        <div class="status-box">
+            <span class="status-icon"></span>
+            System Status: <strong>Collecting Data</strong>
+        </div>
+
+        <p>
+            You have reached a restricted data collection node for the Global Environmental Monitoring Initiative. This server is dedicated to the automated archiving of atmospheric and hydrological sensor data.
+        </p>
+
+        <p>
+            <strong>Access Denied:</strong> Public access to the raw data stream is strictly prohibited due to data sensitivity and compliance with international environmental data protection regulations (IEDPR).
+        </p>
+        
+        <p style="font-size: 13px; color: #666; margin-top: 25px;">
+            If you are an authorized researcher, please connect via your secure VPN tunnel using the designated port protocols. Unauthorized attempts to access the backend are logged and reported.
+        </p>
+
+        <div class="footer">
+            &copy; 2024-2025 EcoData Alliance. All rights reserved. <br>
+            Server ID: 8f92-a1b2-c3d4-node
+        </div>
+    </div>
+</body>
+</html>
