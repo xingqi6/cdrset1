@@ -85,4 +85,93 @@ def list_remote_files():
 
 def cleanup_old_backups(prefix):
     all_files = list_remote_files()
-    target_files = sorted([f for f in all_files if f.startswi
+    target_files = sorted([f for f in all_files if f.startswith(prefix)])
+    while len(target_files) > 5:
+        oldest = target_files.pop(0)
+        run_cmd(f"curl -X DELETE -u '{WEBDAV_USER}:{WEBDAV_PASS}' '{get_remote_url(oldest)}' --silent --insecure")
+
+def backup_data():
+    if not WEBDAV_URL: return
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if os.path.exists(ALIST_DB_LOCAL):
+        name = f"{PREFIX_ALIST}{timestamp}.db"
+        run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' -T '{ALIST_DB_LOCAL}' '{get_remote_url(name)}' --silent --insecure")
+        cleanup_old_backups(PREFIX_ALIST)
+    if os.path.exists(CLOUD_DB_LOCAL):
+        name = f"{PREFIX_CLOUD}{timestamp}.db"
+        run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' -T '{CLOUD_DB_LOCAL}' '{get_remote_url(name)}' --silent --insecure")
+        cleanup_old_backups(PREFIX_CLOUD)
+
+def restore_data():
+    if not WEBDAV_URL: return
+    ensure_remote_dir()
+    all_files = list_remote_files()
+    alist_bks = sorted([f for f in all_files if f.startswith(PREFIX_ALIST)])
+    if alist_bks:
+        run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' '{get_remote_url(alist_bks[-1])}' -o '{ALIST_DB_LOCAL}' --silent --insecure")
+    cloud_bks = sorted([f for f in all_files if f.startswith(PREFIX_CLOUD)])
+    if cloud_bks:
+        run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' '{get_remote_url(cloud_bks[-1])}' -o '{CLOUD_DB_LOCAL}' --silent --insecure")
+
+def set_secret():
+    try:
+        subprocess.run([ALIST_BIN, "admin", "set", SYS_TOKEN], cwd=CORE_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except: pass
+
+# ================= 启动流程 =================
+def start_services():
+    global p_nginx, p_alist, p_cloud
+    
+    # 1. 修复网络
+    patch_network_final()
+    
+    # 2. 准备目录
+    os.makedirs(f"{CORE_DIR}/data", exist_ok=True)
+    
+    # 3. 启动 Alist
+    p_alist = subprocess.Popen([ALIST_BIN, "server", "--no-prefix"], cwd=CORE_DIR)
+    
+    # 4. 设置 Alist 密码
+    time.sleep(5)
+    set_secret() 
+    
+    # =======================================================
+    # [新增] 暴力重置 Cloudreve 密码 (关键步骤)
+    # =======================================================
+    print("\n" + "="*50)
+    print(">>> [Kernel] FORCING PASSWORD RESET...")
+    print(">>> [Kernel] Please look for 'Admin user name' and 'Admin password' below:")
+    print("="*50 + "\n")
+    
+    # 执行重置命令，这会将 output 直接打印到 Logs
+    subprocess.run([CLOUD_BIN, "-c", "conf.ini", "--database-script", "ResetAdminPassword"], cwd=CORE_DIR)
+    
+    print("\n" + "="*50 + "\n")
+    # =======================================================
+
+    # 5. 启动 Cloudreve
+    p_cloud = subprocess.Popen([CLOUD_BIN, "-c", "conf.ini"], cwd=CORE_DIR)
+    
+    # 6. 启动 Nginx
+    print(">>> [Kernel] System Online.")
+    p_nginx = subprocess.Popen(["nginx", "-g", "daemon off;"])
+
+def stop_handler(signum, frame):
+    if p_nginx: p_nginx.terminate()
+    if p_cloud: p_cloud.terminate()
+    if p_alist: p_alist.terminate()
+    backup_data()
+    sys.exit(0)
+
+if __name__ == "__main__":
+    restore_data()
+    start_services()
+    signal.signal(signal.SIGTERM, stop_handler)
+    signal.signal(signal.SIGINT, stop_handler)
+    step = 0
+    while True:
+        time.sleep(1)
+        step += 1
+        if step >= SYNC_INTERVAL:
+            backup_data()
+            step = 0
