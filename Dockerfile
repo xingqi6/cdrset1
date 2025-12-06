@@ -1,12 +1,14 @@
-# 使用 Debian 12
+# 使用 Debian 12 基础镜像
 FROM python:3.11-bookworm
 
-# 1. 安装基础环境
+# 1. 安装环境
 RUN apt-get update && apt-get install -y \
     nginx curl wget procps ca-certificates fuse rclone \
     && rm -rf /var/lib/apt/lists/* && update-ca-certificates
 
-# 2. 核心工作目录
+RUN pip install --no-cache-dir bcrypt
+
+# 2. 准备目录
 WORKDIR /usr/local/sys_kernel
 
 # 3. 下载程序
@@ -16,25 +18,26 @@ RUN wget https://github.com/cloudreve/cloudreve/releases/download/3.8.3/cloudrev
     && tar -zxvf cloudreve_3.8.3_linux_amd64.tar.gz && mv cloudreve net_service && rm cloudreve_3.8.3_linux_amd64.tar.gz
 RUN chmod +x io_driver net_service
 
-# =========================================================
-# [重点修复] 网页文件处理
-# =========================================================
-# 1. 先把 Nginx 默认的 html 文件夹清空
+# ========================================================
+# [暴力修复] 解决 Nginx 欢迎页问题
+# ========================================================
+# 1. 删除 Nginx 默认的首页文件
+RUN rm -f /var/www/html/index.nginx-debian.html
 RUN rm -rf /var/www/html/*
 
-# 2. 复制 fake_site 文件夹里的“所有内容”到 html 根目录
-# 注意：这里 fake_site/ 后面加斜杠，表示复制内容而不是文件夹本身
+# 2. 复制我们的伪装页 (确保 fake_site 文件夹里有 index.html)
 COPY fake_site/ /var/www/html/
 
-# 3. 复制 Nginx 配置文件 (覆盖默认配置)
-COPY nginx.conf /etc/nginx/sites-available/default
-# =========================================================
+# 3. 赋予权限确保 Nginx 能读取
+RUN chmod -R 755 /var/www/html
+# ========================================================
 
-# 5. 其他配置
+# 配置文件
+COPY nginx.conf /etc/nginx/sites-available/default
 COPY conf.ini /usr/local/sys_kernel/conf.ini
 COPY boot.py /usr/local/sys_kernel/boot.py
 
-# 6. 启动
+# 启动
 RUN mkdir -p /usr/local/sys_kernel/data
 EXPOSE 7860
 CMD ["python3", "-u", "/usr/local/sys_kernel/boot.py"]
