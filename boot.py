@@ -6,8 +6,6 @@ import sys
 import re
 import json
 import urllib.request
-import sqlite3
-import bcrypt
 from datetime import datetime
 
 # ================= 环境变量 =================
@@ -15,12 +13,8 @@ WEBDAV_URL = os.environ.get("WEBDAV_URL", "").rstrip('/')
 WEBDAV_USER = os.environ.get("WEBDAV_USERNAME")
 WEBDAV_PASS = os.environ.get("WEBDAV_PASSWORD")
 BACKUP_PATH = os.environ.get("WEBDAV_BACKUP_PATH", "cloud_kernel_backup").strip('/')
-SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", 1800)) 
-SYS_TOKEN = os.environ.get("SYS_TOKEN", "Admin123") 
-
-# 自定义账号密码
-INIT_USER = os.environ.get("K_IDENTITY") 
-INIT_PASS = os.environ.get("K_SECRET") 
+SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", 1800)) # 默认30分钟备份一次
+SYS_TOKEN = os.environ.get("SYS_TOKEN", "Admin123")        # Alist 的管理密码
 
 # ================= 路径定义 =================
 CORE_DIR = "/usr/local/sys_kernel"
@@ -28,6 +22,8 @@ ALIST_BIN = f"{CORE_DIR}/io_driver"
 CLOUD_BIN = f"{CORE_DIR}/net_service"
 ALIST_DB_LOCAL = f"{CORE_DIR}/data/data.db"
 CLOUD_DB_LOCAL = f"{CORE_DIR}/sys.db"
+
+# 备份文件前缀 (用于识别和轮替)
 PREFIX_ALIST = "bk_io_"
 PREFIX_CLOUD = "bk_net_"
 
@@ -36,129 +32,112 @@ p_alist = None
 p_cloud = None
 p_rclone = None
 
-# ================= 核心功能：强制注入自定义凭证 =================
-def force_inject_credentials():
-    """
-    循环检测数据库，一旦就绪立即强制修改管理员密码。
-    """
-    if not INIT_USER or not INIT_PASS:
-        return 
-    
-    print(f">>> [Kernel] Auth: Preparing to force inject credentials...")
-    
-    # 1. 确保 Cloudreve 已经把表建好了
-    max_retries = 20
-    for i in range(max_retries):
-        if not os.path.exists(CLOUD_DB_LOCAL):
-            print(f">>> [Kernel] Auth: Waiting for DB creation ({i+1}/{max_retries})...")
-            time.sleep(2)
-            continue
-            
-        try:
-            conn = sqlite3.connect(CLOUD_DB_LOCAL)
-            cursor = conn.cursor()
-            # 检查表是否存在
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='cd_users';")
-            if cursor.fetchone():
-                conn.close()
-                break # 表存在，跳出循环开始注入
-            else:
-                conn.close()
-                print(f">>> [Kernel] Auth: DB exists but table missing, waiting...")
-                time.sleep(2)
-        except:
-            time.sleep(2)
-            
-    # 2. 执行注入
-    try:
-        conn = sqlite3.connect(CLOUD_DB_LOCAL)
-        cursor = conn.cursor()
-        
-        # Cloudreve 使用 bcrypt，这里我们生成兼容的哈希
-        hashed = bcrypt.hashpw(INIT_PASS.encode('utf-8'), bcrypt.gensalt())
-        
-        # 强制覆盖 ID=1 的用户 (通常是 admin@cloudreve.org)
-        # 我们同时修改 邮箱(账号) 和 密码
-        cursor.execute("UPDATE cd_users SET email = ?, password = ? WHERE id = 1", (INIT_USER, hashed))
-        
-        if cursor.rowcount == 0:
-            # 如果没有 ID=1 的用户 (极少见)，插入一个
-            print(">>> [Kernel] Auth: Admin user not found, creating new...")
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            cursor.execute(f"INSERT INTO cd_users (id, email, password, nickname, status, created_at) VALUES (1, ?, ?, 'Admin', 1, '{now}')", (INIT_USER, hashed))
-            
-        conn.commit()
-        conn.close()
-        print(f"\n{'='*40}")
-        print(f">>> [Kernel] SUCCESS: Admin credentials updated!")
-        print(f">>> User: {INIT_USER}")
-        print(f">>> Pass: {INIT_PASS}")
-        print(f"{'='*40}\n")
-    except Exception as e:
-        print(f">>> [Kernel] Auth Injection Error: {e}")
-
-# ================= 网络修复 =================
+# ================= 网络修复 (确保能连上 HF) =================
 def patch_network_final():
-    print(">>> [Kernel] Optimizing network routing...")
+    print(">>> [Kernel] Applying stable network patch...")
     targets = ["huggingface.co", "s3.huggingface.co", "cdn-lfs.huggingface.co"]
-    stable_ips = ["18.172.170.60", "18.172.170.92", "18.172.170.36"]
+    # AWS US-East-1 CloudFront IPs
+    stable_ips = ["18.172.170.60", "18.172.170.92", "18.172.170.36", "18.172.170.52"]
     try:
-        with open("/etc/nsswitch.conf", "w") as f: f.write("hosts: files dns\nnetworks: files\n")
+        with open("/etc/nsswitch.conf", "w") as f:
+            f.write("hosts: files dns\nnetworks: files\n")
         with open("/etc/hosts", "a") as f:
-            f.write(f"\n# Routing Table\n")
+            f.write(f"\n# Network Patch\n")
             for domain in targets:
-                for ip in stable_ips: f.write(f"{ip} {domain}\n")
+                for ip in stable_ips:
+                    f.write(f"{ip} {domain}\n")
     except: pass
 
-# ================= 备份与恢复 =================
+# ================= 备份与轮替核心逻辑 (Keep 5) =================
 def run_cmd(cmd):
-    try: subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
     except: return False
 
-def get_remote_url(filename): return f"{WEBDAV_URL}/{BACKUP_PATH}/{filename}"
+def get_remote_url(filename):
+    return f"{WEBDAV_URL}/{BACKUP_PATH}/{filename}"
 
 def ensure_remote_dir():
     if not WEBDAV_URL: return
+    # MKCOL 创建目录
     run_cmd(f"curl -X MKCOL -u '{WEBDAV_USER}:{WEBDAV_PASS}' '{WEBDAV_URL}/{BACKUP_PATH}/' --silent --insecure")
 
 def list_remote_files():
+    """获取远程目录下的所有文件名"""
     if not WEBDAV_URL: return []
     cmd = ["curl", "-X", "PROPFIND", "-u", f"{WEBDAV_USER}:{WEBDAV_PASS}", f"{WEBDAV_URL}/{BACKUP_PATH}/", "--header", "Depth: 1", "--silent", "--insecure"]
     try:
         output = subprocess.check_output(cmd).decode('utf-8')
+        # 简单的正则提取 href
         matches = re.findall(r'<[a-zA-Z0-9:]*href>([^<]+)</[a-zA-Z0-9:]*href>', output, re.IGNORECASE)
+        # 清洗路径，只保留文件名
         return [m.rstrip('/').split('/')[-1] for m in matches if m.rstrip('/').split('/')[-1]]
     except: return []
 
 def cleanup_old_backups(prefix):
+    """
+    轮替逻辑：
+    1. 获取所有文件
+    2. 筛选出当前前缀的文件 (例如 bk_io_...)
+    3. 按文件名排序 (时间戳在文件名里，所以ASCII排序=时间排序)
+    4. 如果数量 > 5，删除最旧的 n-5 个
+    """
     all_files = list_remote_files()
+    # 筛选并排序
     target_files = sorted([f for f in all_files if f.startswith(prefix)])
-    while len(target_files) > 5:
-        oldest = target_files.pop(0)
-        run_cmd(f"curl -X DELETE -u '{WEBDAV_USER}:{WEBDAV_PASS}' '{get_remote_url(oldest)}' --silent --insecure")
+    
+    count = len(target_files)
+    if count > 5:
+        # 需要删除的文件列表 (从最早的开始，删掉多出来的部分)
+        to_delete = target_files[:(count - 5)]
+        print(f">>> [Backup] Rotating: Deleting {len(to_delete)} old files...")
+        
+        for f in to_delete:
+            del_url = get_remote_url(f)
+            run_cmd(f"curl -X DELETE -u '{WEBDAV_USER}:{WEBDAV_PASS}' '{del_url}' --silent --insecure")
 
 def backup_data():
     if not WEBDAV_URL: return
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    print(f">>> [Backup] Starting sync at {timestamp}...")
+    
+    # 1. 备份 Alist 数据库
     if os.path.exists(ALIST_DB_LOCAL):
         name = f"{PREFIX_ALIST}{timestamp}.db"
-        run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' -T '{ALIST_DB_LOCAL}' '{get_remote_url(name)}' --silent --insecure")
-        cleanup_old_backups(PREFIX_ALIST)
+        success = run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' -T '{ALIST_DB_LOCAL}' '{get_remote_url(name)}' --silent --insecure")
+        if success:
+            cleanup_old_backups(PREFIX_ALIST) # 上传成功后执行轮替
+
+    # 2. 备份 Cloudreve 数据库
     if os.path.exists(CLOUD_DB_LOCAL):
         name = f"{PREFIX_CLOUD}{timestamp}.db"
-        run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' -T '{CLOUD_DB_LOCAL}' '{get_remote_url(name)}' --silent --insecure")
-        cleanup_old_backups(PREFIX_CLOUD)
+        success = run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' -T '{CLOUD_DB_LOCAL}' '{get_remote_url(name)}' --silent --insecure")
+        if success:
+            cleanup_old_backups(PREFIX_CLOUD) # 上传成功后执行轮替
+            
+    print(f">>> [Backup] Sync complete.")
 
 def restore_data():
+    """启动时恢复最新的那一份"""
     if not WEBDAV_URL: return
+    print(">>> [System] Checking for backups...")
     ensure_remote_dir()
     all_files = list_remote_files()
+    
+    # 恢复 Alist (取最后一个，即最新的)
     alist_bks = sorted([f for f in all_files if f.startswith(PREFIX_ALIST)])
     if alist_bks:
-        run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' '{get_remote_url(alist_bks[-1])}' -o '{ALIST_DB_LOCAL}' --silent --insecure")
+        latest = alist_bks[-1]
+        print(f">>> [System] Restoring IO DB: {latest}")
+        run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' '{get_remote_url(latest)}' -o '{ALIST_DB_LOCAL}' --silent --insecure")
+    
+    # 恢复 Cloudreve
     cloud_bks = sorted([f for f in all_files if f.startswith(PREFIX_CLOUD)])
     if cloud_bks:
-        run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' '{get_remote_url(cloud_bks[-1])}' -o '{CLOUD_DB_LOCAL}' --silent --insecure")
+        latest = cloud_bks[-1]
+        print(f">>> [System] Restoring Cloud DB: {latest}")
+        run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' '{get_remote_url(latest)}' -o '{CLOUD_DB_LOCAL}' --silent --insecure")
 
 def set_secret():
     try: subprocess.run([ALIST_BIN, "admin", "set", SYS_TOKEN], cwd=CORE_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -167,12 +146,15 @@ def set_secret():
 def start_rclone_bridge():
     global p_rclone
     print(">>> [Kernel] Starting Bridge...")
+    # 生成 Rclone 配置
     rclone_config_cmd = [
         "rclone", "config", "create", "alist_proxy", "webdav",
         f"url=http://127.0.0.1:5244/dav/", "vendor=other", "user=admin", f"pass={SYS_TOKEN}",
         "--non-interactive", "--obscure", "--config", "/tmp/rclone.conf"
     ]
     subprocess.run(rclone_config_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    # 启动 S3 服务
     serve_cmd = [
         "rclone", "serve", "s3", "alist_proxy:/", "--addr", ":5200",
         "--access-key-id", "cloudreve", "--secret-access-key", "cloudreve",
@@ -183,44 +165,41 @@ def start_rclone_bridge():
 # ================= 启动流程 =================
 def start_services():
     global p_nginx, p_alist, p_cloud
+    
+    # 1. 修复网络
     patch_network_final()
+    
+    # 2. 准备目录
     os.makedirs(f"{CORE_DIR}/data", exist_ok=True)
     
-    # 1. 恢复数据
+    # 3. 恢复数据 (如果有备份，这里会覆盖本地文件)
     restore_data()
     
-    # 2. 启动驱动
+    # 4. 启动 Alist
     p_alist = subprocess.Popen([ALIST_BIN, "server", "--no-prefix"], cwd=CORE_DIR)
     time.sleep(5)
     set_secret() 
+    
+    # 5. 启动 Rclone
     start_rclone_bridge()
     time.sleep(2)
 
-    # 3. 初始化并强注密码 (如果文件不存在，先让它跑一会儿生成)
-    if not os.path.exists(CLOUD_DB_LOCAL):
-        print(">>> [Kernel] DB missing, initializing...")
-        temp_proc = subprocess.Popen([CLOUD_BIN, "-c", "conf.ini"], cwd=CORE_DIR)
-        # 等待久一点，确保表建立
-        time.sleep(15) 
-        temp_proc.terminate()
-        time.sleep(3)
-    
-    # 4. 执行注入 (此时数据库一定存在)
-    force_inject_credentials()
-
-    # 5. 正式启动
+    # 6. 启动 Cloudreve
+    # 重点：不再注入密码，直接启动。
+    # 如果是新数据库，它会打印密码到日志；如果是恢复的数据库，它保持原样。
     p_cloud = subprocess.Popen([CLOUD_BIN, "-c", "conf.ini"], cwd=CORE_DIR)
     
-    # 6. 启动 Nginx
+    # 7. 启动 Nginx
     print(">>> [Kernel] System Online.")
     p_nginx = subprocess.Popen(["nginx", "-g", "daemon off;"])
 
 def stop_handler(signum, frame):
+    print(">>> [Kernel] Shutting down...")
     if p_nginx: p_nginx.terminate()
     if p_cloud: p_cloud.terminate()
     if p_alist: p_alist.terminate()
     if p_rclone: p_rclone.terminate()
-    backup_data()
+    backup_data() # 退出时备份一次
     sys.exit(0)
 
 if __name__ == "__main__":
