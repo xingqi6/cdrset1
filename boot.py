@@ -10,7 +10,7 @@ import sqlite3
 import bcrypt
 from datetime import datetime
 
-# ================= 环境变量配置 (已混淆) =================
+# ================= 环境变量 =================
 WEBDAV_URL = os.environ.get("WEBDAV_URL", "").rstrip('/')
 WEBDAV_USER = os.environ.get("WEBDAV_USERNAME")
 WEBDAV_PASS = os.environ.get("WEBDAV_PASSWORD")
@@ -18,9 +18,7 @@ BACKUP_PATH = os.environ.get("WEBDAV_BACKUP_PATH", "cloud_kernel_backup").strip(
 SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", 1800)) 
 SYS_TOKEN = os.environ.get("SYS_TOKEN", "Admin123") 
 
-# [混淆] 初始账号密码变量
-# K_IDENTITY -> 初始邮箱
-# K_SECRET   -> 初始密码
+# 自定义账号密码
 INIT_USER = os.environ.get("K_IDENTITY") 
 INIT_PASS = os.environ.get("K_SECRET") 
 
@@ -38,32 +36,66 @@ p_alist = None
 p_cloud = None
 p_rclone = None
 
-# ================= 核心功能：注入自定义凭证 =================
-def inject_admin_credentials():
+# ================= 核心功能：强制注入自定义凭证 =================
+def force_inject_credentials():
     """
-    仅在全新初始化时，将 K_IDENTITY 和 K_SECRET 注入数据库。
-    如果数据库已存在（从备份恢复），则直接跳过，保护用户后续修改的密码。
+    循环检测数据库，一旦就绪立即强制修改管理员密码。
     """
     if not INIT_USER or not INIT_PASS:
         return 
     
-    print(f">>> [Kernel] Bootstrap: Injecting identity credentials...")
+    print(f">>> [Kernel] Auth: Preparing to force inject credentials...")
+    
+    # 1. 确保 Cloudreve 已经把表建好了
+    max_retries = 20
+    for i in range(max_retries):
+        if not os.path.exists(CLOUD_DB_LOCAL):
+            print(f">>> [Kernel] Auth: Waiting for DB creation ({i+1}/{max_retries})...")
+            time.sleep(2)
+            continue
+            
+        try:
+            conn = sqlite3.connect(CLOUD_DB_LOCAL)
+            cursor = conn.cursor()
+            # 检查表是否存在
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='cd_users';")
+            if cursor.fetchone():
+                conn.close()
+                break # 表存在，跳出循环开始注入
+            else:
+                conn.close()
+                print(f">>> [Kernel] Auth: DB exists but table missing, waiting...")
+                time.sleep(2)
+        except:
+            time.sleep(2)
+            
+    # 2. 执行注入
     try:
-        # 连接 SQLite
         conn = sqlite3.connect(CLOUD_DB_LOCAL)
         cursor = conn.cursor()
         
-        # 使用 bcrypt 计算哈希 (Cloudreve 的密码存储方式)
+        # Cloudreve 使用 bcrypt，这里我们生成兼容的哈希
         hashed = bcrypt.hashpw(INIT_PASS.encode('utf-8'), bcrypt.gensalt())
         
-        # 强制更新 ID=1 (管理员) 的邮箱和密码
+        # 强制覆盖 ID=1 的用户 (通常是 admin@cloudreve.org)
+        # 我们同时修改 邮箱(账号) 和 密码
         cursor.execute("UPDATE cd_users SET email = ?, password = ? WHERE id = 1", (INIT_USER, hashed))
         
+        if cursor.rowcount == 0:
+            # 如果没有 ID=1 的用户 (极少见)，插入一个
+            print(">>> [Kernel] Auth: Admin user not found, creating new...")
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute(f"INSERT INTO cd_users (id, email, password, nickname, status, created_at) VALUES (1, ?, ?, 'Admin', 1, '{now}')", (INIT_USER, hashed))
+            
         conn.commit()
         conn.close()
-        print(">>> [Kernel] Credentials synced.")
+        print(f"\n{'='*40}")
+        print(f">>> [Kernel] SUCCESS: Admin credentials updated!")
+        print(f">>> User: {INIT_USER}")
+        print(f">>> Pass: {INIT_PASS}")
+        print(f"{'='*40}\n")
     except Exception as e:
-        print(f">>> [Kernel] Injection warning: {e}")
+        print(f">>> [Kernel] Auth Injection Error: {e}")
 
 # ================= 网络修复 =================
 def patch_network_final():
@@ -118,20 +150,15 @@ def backup_data():
         cleanup_old_backups(PREFIX_CLOUD)
 
 def restore_data():
-    if not WEBDAV_URL: return False
+    if not WEBDAV_URL: return
     ensure_remote_dir()
     all_files = list_remote_files()
-    restored_cloud = False
-    
     alist_bks = sorted([f for f in all_files if f.startswith(PREFIX_ALIST)])
     if alist_bks:
         run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' '{get_remote_url(alist_bks[-1])}' -o '{ALIST_DB_LOCAL}' --silent --insecure")
-    
     cloud_bks = sorted([f for f in all_files if f.startswith(PREFIX_CLOUD)])
     if cloud_bks:
         run_cmd(f"curl -u '{WEBDAV_USER}:{WEBDAV_PASS}' '{get_remote_url(cloud_bks[-1])}' -o '{CLOUD_DB_LOCAL}' --silent --insecure")
-        restored_cloud = True
-    return restored_cloud
 
 def set_secret():
     try: subprocess.run([ALIST_BIN, "admin", "set", SYS_TOKEN], cwd=CORE_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -159,34 +186,32 @@ def start_services():
     patch_network_final()
     os.makedirs(f"{CORE_DIR}/data", exist_ok=True)
     
-    # 1. 尝试恢复
-    is_restored = restore_data()
+    # 1. 恢复数据
+    restore_data()
     
-    # 2. 启动驱动层
+    # 2. 启动驱动
     p_alist = subprocess.Popen([ALIST_BIN, "server", "--no-prefix"], cwd=CORE_DIR)
     time.sleep(5)
     set_secret() 
     start_rclone_bridge()
     time.sleep(2)
 
-    # 3. Cloudreve 初始化 (仅在全新安装时注入密码)
-    if not is_restored and not os.path.exists(CLOUD_DB_LOCAL):
-        print(">>> [Kernel] Initializing new instance...")
-        # 预启动以生成数据库
+    # 3. 初始化并强注密码 (如果文件不存在，先让它跑一会儿生成)
+    if not os.path.exists(CLOUD_DB_LOCAL):
+        print(">>> [Kernel] DB missing, initializing...")
         temp_proc = subprocess.Popen([CLOUD_BIN, "-c", "conf.ini"], cwd=CORE_DIR)
-        time.sleep(8) 
+        # 等待久一点，确保表建立
+        time.sleep(15) 
         temp_proc.terminate()
-        time.sleep(2)
-        
-        # 注入你的隐蔽账号密码
-        inject_admin_credentials()
-    else:
-        print(">>> [Kernel] Instance restored. Skipping auth injection.")
+        time.sleep(3)
+    
+    # 4. 执行注入 (此时数据库一定存在)
+    force_inject_credentials()
 
-    # 4. 正式启动
+    # 5. 正式启动
     p_cloud = subprocess.Popen([CLOUD_BIN, "-c", "conf.ini"], cwd=CORE_DIR)
     
-    # 5. 网关启动
+    # 6. 启动 Nginx
     print(">>> [Kernel] System Online.")
     p_nginx = subprocess.Popen(["nginx", "-g", "daemon off;"])
 
